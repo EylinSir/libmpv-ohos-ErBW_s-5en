@@ -1,0 +1,95 @@
+diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
+index 7747067..0dfe931 100644
+--- a/filters/f_decoder_wrapper.h
++++ b/filters/f_decoder_wrapper.h
+@@ -76,6 +76,7 @@ enum dec_ctrl {
+     VDCTRL_SET_FRAMEDROP,
+     VDCTRL_CHECK_FORCED_EOF,
+     VDCTRL_SET_PLAYBACK_SPEED,
++    VDCTRL_SET_VRR_ENABLED,
+     // int[2]: preroll performance hint, preserve all decoded frames
+     VDCTRL_SET_DECODE_HINTS,
+ };
+diff --git a/options/options.c b/options/options.c
+index 4745620..37e1bb4 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -684,6 +684,8 @@ static const m_option_t mp_opts[] = {
+     {"audio-channels", OPT_CHANNELS(audio_output_channels), .flags = UPDATE_AUDIO},
+     {"audio-format", OPT_AUDIOFORMAT(audio_output_format), .flags = UPDATE_AUDIO},
+     {"speed", OPT_DOUBLE(playback_speed), M_RANGE(0.01, 100.0)},
++    // Embedding policy hook, not a display refresh-rate guarantee.
++    {"ohos-vrr", OPT_BOOL(ohos_vrr)},
+     {"pitch", OPT_DOUBLE(playback_pitch), M_RANGE(0.01, 100.0)},
+ 
+     {"audio-pitch-correction", OPT_BOOL(pitch_correction)},
+@@ -1066,6 +1068,7 @@ static const struct MPOpts mp_default_opts = {
+     .audio_display = 1,
+     .audio_output_format = 0,  // AF_FORMAT_UNKNOWN
+     .playback_speed = 1.,
++    .ohos_vrr = true,
+     .playback_pitch = 1.,
+     .pitch_correction = true,
+     .audiofile_auto = -1,
+diff --git a/options/options.h b/options/options.h
+index 89d0c71..6ff62e6 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -339,6 +339,7 @@ typedef struct MPOpts {
+     int audio_output_format;
+     int force_srate;
+     double playback_speed;
++    bool ohos_vrr;
+     double playback_pitch;
+     bool pitch_correction;
+     struct m_obj_settings *vf_settings;
+diff --git a/player/command.c b/player/command.c
+index 1f6253f..2365c7f 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -8043,6 +8043,14 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
+         run_command_opts(mpctx);
+     }
+ 
++    if (opt_ptr == &opts->ohos_vrr) {
++        struct track *track = mpctx->current_track[0][STREAM_VIDEO];
++        if (track && track->dec)
++            mp_decoder_wrapper_control(track->dec, VDCTRL_SET_VRR_ENABLED,
++                                       &opts->ohos_vrr);
++        mp_wakeup_core(mpctx);
++    }
++
+     if (opt_ptr == &opts->playback_speed || opt_ptr == &opts->playback_pitch ||
+         opt_ptr == &opts->pitch_correction) {
+         update_playback_speed(mpctx);
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 8163bb0..b5599dd 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -858,6 +858,13 @@ static void init_avctx(struct mp_filter *vd)
+     }
+ #endif
+ 
++    if (lavc_codec->wrapper_name &&
++        strcmp(lavc_codec->wrapper_name, "ohcodec") == 0) {
++        struct MPOpts *mpopts = mp_get_config_group(NULL, vd->global, &mp_opt_root);
++        av_opt_set_int(avctx, "ohcodec_vrr", mpopts->ohos_vrr, AV_OPT_SEARCH_CHILDREN);
++        talloc_free(mpopts);
++    }
++
+     /* open it */
+     if (avcodec_open2(avctx, lavc_codec, NULL) < 0)
+         goto error;
+@@ -1422,6 +1429,12 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
+         int ret = avcodec_ohcodec_set_decode_hints(ctx->avctx, hints[0], hints[1]);
+         return ret >= 0 ? CONTROL_TRUE : CONTROL_FALSE;
+     }
++    case VDCTRL_SET_VRR_ENABLED: {
++        if (!ctx->avctx)
++            return CONTROL_FALSE;
++        int ret = avcodec_ohcodec_set_vrr_enabled(ctx->avctx, *(bool *)arg);
++        return ret >= 0 ? CONTROL_TRUE : CONTROL_FALSE;
++    }
+     case VDCTRL_SET_PLAYBACK_SPEED: {
+         AVCodecContext *avctx = ctx->avctx;
+         if (!avctx)

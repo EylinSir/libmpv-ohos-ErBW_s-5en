@@ -1,0 +1,427 @@
+diff --git a/libavcodec/avcodec.h b/libavcodec/avcodec.h
+index 599630f..8235a7f 100644
+--- a/libavcodec/avcodec.h
++++ b/libavcodec/avcodec.h
+@@ -2923,6 +2923,10 @@ int avcodec_default_execute2(AVCodecContext *c, int (*func)(AVCodecContext *c2,
+  * @return zero on success, a negative AVERROR code otherwise
+  */
+ int avcodec_ohcodec_set_playback_speed(AVCodecContext *avctx, double speed);
++/** Decoder-thread VRR request. Unsupported decoders return AVERROR(ENOSYS).
++ * Controls decoder analysis, not a guarantee of display refresh-rate changes.
++ */
++int avcodec_ohcodec_set_vrr_enabled(AVCodecContext *avctx, int enabled);
+ /** Decoder-thread hint: accelerate preroll without changing media time.
+  * preserve_frames suppresses adaptive frame retention for timestamp repair.
+  * Other codecs return AVERROR(ENOSYS). Both flags accept zero or one.
+diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
+index 5135081..cee3ecf 100644
+--- a/libavcodec/ohdec.c
++++ b/libavcodec/ohdec.c
+@@ -131,7 +131,13 @@ typedef struct OHCodecDecContext {
+     bool preroll;
+     bool preserve_frames;
+     bool smart_fluency_active;
++    bool smart_fluency_prepared;
+     bool smart_fluency_failed;
++    int full_restore_error;
++    int vrr_enabled;
++    int vrr_applied;
++    bool vrr_pending;
++    bool vrr_failed;
+     bool diagnostics_enabled;
+     int64_t policy_requested_ns;
+ } OHCodecDecContext;
+@@ -435,7 +441,44 @@ static int oh_decode_init_hwframes(OHCodecDecContext *s, AVCodecContext *avctx,
+     return ret;
+ }
+ 
+-static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
++static int oh_decode_prepare_smart_fluency(OHCodecDecContext *s,
++                                           AVCodecContext *avctx,
++                                           OH_AVFormat *format)
++{
++    if (!s->keys.retention_mode || !s->keys.decoder_speed ||
++        !oh_decode_supports_smart_fluency(avctx))
++        return 0;
++    // MV output must be requested at Configure, not on the first speed change.
++    // No packets are submitted until receive_frame restores the runtime policy.
++    if (!OH_AVFormat_SetIntValue(format, s->keys.retention_mode,
++                                 OH_FRAME_RETENTION_MODE_ADAPTIVE) ||
++        !OH_AVFormat_SetDoubleValue(format, s->keys.decoder_speed, 1.0))
++        return AVERROR_UNKNOWN;
++    return 1;
++}
++
++static bool oh_decode_policy_rejected(OH_AVErrCode err)
++{
++    return err == AV_ERR_INVALID_VAL || err == AV_ERR_UNSUPPORT ||
++           err == AV_ERR_UNSUPPORTED_FORMAT;
++}
++
++static int oh_decode_reset_for_policy_retry(OHCodecDecContext *s,
++                                           AVCodecContext *avctx)
++{
++    OH_AVErrCode err = OH_VideoDecoder_Reset(s->dec);
++    if (err == AV_ERR_OK)
++        return 0;
++    av_log(avctx, AV_LOG_WARNING,
++           "[OHCodecPolicy] init-reset=failed error=%d recreate=once\n", err);
++    // No callbacks or buffers exist yet. Recreate only when Reset failed.
++    av_refstruct_unref(&s->dec_ref);
++    s->dec = NULL;
++    return oh_decode_create(s, avctx);
++}
++
++static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx,
++                                bool smart_policy)
+ {
+     int ret;
+     OHNativeWindow *window = NULL;
+@@ -478,36 +521,45 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
+     else
+         OH_AVFormat_SetIntValue(format, OH_MD_KEY_PIXEL_FORMAT,
+                                 AV_PIXEL_FORMAT_SURFACE_FORMAT);
+-    bool frame_rate_set = false;
+-    bool vrr_requested = false;
+     if (s->source_frame_rate > 0.0 && s->keys.frame_rate) {
+-        frame_rate_set = OH_AVFormat_SetDoubleValue(format,
+-                                                    s->keys.frame_rate,
+-                                                    s->source_frame_rate);
+-        if (!frame_rate_set)
++        if (!OH_AVFormat_SetDoubleValue(format, s->keys.frame_rate,
++                                        s->source_frame_rate))
+             av_log(avctx, AV_LOG_WARNING,
+-                   "[OHCodecPolicy] vrr=request-failed mode=%s fps=%.3f "
++                   "[OHCodecPolicy] frame-rate=request-failed mode=%s fps=%.3f "
+                    "reason=frame-rate-format\n",
+-                   s->output_to_window ? "surface" : "buffer",
++                   s->direct_surface_output ? "direct-surface" : "gpu-buffer",
+                    s->source_frame_rate);
+     }
+-    if (frame_rate_set && s->keys.enable_vrr) {
+-        vrr_requested = OH_AVFormat_SetIntValue(format,
+-                                                s->keys.enable_vrr, 1);
+-        if (!vrr_requested)
+-            av_log(avctx, AV_LOG_WARNING,
+-                   "[OHCodecPolicy] vrr=request-failed mode=%s fps=%.3f "
+-                   "reason=vrr-format\n",
+-                   s->output_to_window ? "surface" : "buffer",
+-                   s->source_frame_rate);
+-    } else if (s->source_frame_rate <= 0.0) {
++    if (s->source_frame_rate <= 0.0) {
+         av_log(avctx, AV_LOG_WARNING,
+                "[OHCodecPolicy] vrr=unavailable mode=%s "
+                "reason=source-frame-rate\n",
+-               s->output_to_window ? "surface" : "buffer");
++               s->direct_surface_output ? "direct-surface" : "gpu-buffer");
+     }
++    // VRR is an independent SetParameter request after Start, never Configure.
++    int prepare_ret = smart_policy
++        ? oh_decode_prepare_smart_fluency(s, avctx, format) : 0;
++    if (prepare_ret < 0) {
++        OH_AVFormat_Destroy(format);
++        return prepare_ret;
++    }
++    bool smart_prepared = prepare_ret > 0;
+     OH_AVErrCode err = OH_VideoDecoder_Configure(s->dec, format);
+     OH_AVFormat_Destroy(format);
++
++    if (smart_prepared && oh_decode_policy_rejected(err)) {
++        av_log(avctx, AV_LOG_WARNING,
++               "[OHCodecPolicy] smart-init=request-rejected error=%d "
++               "retry=without-smart-parameters\n", err);
++        ret = oh_decode_reset_for_policy_retry(s, avctx);
++        if (ret < 0)
++            return ret;
++        ret = oh_decode_set_format(s, avctx, false);
++        // Only a successful baseline retry establishes an optional-policy issue.
++        if (ret >= 0)
++            s->smart_fluency_failed = true;
++        return ret;
++    }
+     if (err != AV_ERR_OK) {
+         ret = ff_oh_err_to_ff_err(err);
+         av_log(avctx, AV_LOG_ERROR, "Decoder configure failed, %d, %s\n",
+@@ -525,13 +577,12 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
+         }
+     }
+ 
+-    if (vrr_requested)
++    s->smart_fluency_prepared = smart_prepared;
++    s->smart_fluency_active = smart_prepared;
++    if (smart_prepared)
+         av_log(avctx, AV_LOG_WARNING,
+-               "[OHCodecPolicy] vrr=requested mode=%s fps=%.3f "
+-               "configure=ok\n",
+-               s->output_to_window ? "surface" : "buffer",
+-               s->source_frame_rate);
+-
++               "[OHCodecPolicy] smart-fluency=prepared initialize=adaptive "
++               "mv=requested configure=ok\n");
+     return 0;
+ }
+ 
+@@ -754,6 +805,8 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
+         s->source_frame_rate = 0.0;
+     s->requested_playback_speed = 1.0;
+     s->playback_policy_pending = true;
++    s->vrr_applied = -1;
++    s->vrr_pending = true;
+     s->dovi_probe_packets = OH_DOVI_PROBE_PACKETS;
+     s->dovi_ctx.logctx = avctx;
+     if (avctx->codec_id == AV_CODEC_ID_HEVC) {
+@@ -777,7 +830,7 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
+     ret = oh_decode_create(s, avctx);
+     if (ret < 0)
+         return ret;
+-    ret = oh_decode_set_format(s, avctx);
++    ret = oh_decode_set_format(s, avctx, true);
+     if (ret < 0)
+         return ret;
+ 
+@@ -1125,13 +1178,107 @@ void avcodec_ohcodec_set_diagnostics(AVCodecContext *avctx, int enabled)
+         ((OHCodecDecContext *)avctx->priv_data)->diagnostics_enabled = enabled;
+ }
+ 
+-static void oh_decode_update_playback_policy(AVCodecContext *avctx)
++static int oh_decode_policy_error(AVCodecContext *avctx, const char *feature,
++                                  OH_AVErrCode err, bool *failed)
++{
++    if (err == AV_ERR_OK)
++        return 0;
++    if (oh_decode_policy_rejected(err)) {
++        if (failed)
++            *failed = true;
++        av_log(avctx, AV_LOG_WARNING,
++               "[OHCodecPolicy] %s=request-rejected error=%d\n", feature, err);
++        return 0;
++    }
++    av_log(avctx, AV_LOG_ERROR,
++           "[OHCodecPolicy] %s=decoder-error error=%d\n", feature, err);
++    return ff_oh_err_to_ff_err(err);
++}
++
++static int oh_decode_restore_full(AVCodecContext *avctx)
++{
++    OHCodecDecContext *s = avctx->priv_data;
++    OH_AVFormat *format = OH_AVFormat_Create();
++    if (!format) {
++        s->full_restore_error = AVERROR(ENOMEM);
++        return s->full_restore_error;
++    }
++    bool valid = OH_AVFormat_SetIntValue(format, s->keys.retention_mode,
++                                        OH_FRAME_RETENTION_MODE_FULL);
++    OH_AVErrCode err = valid ? OH_VideoDecoder_SetParameter(s->dec, format)
++                            : AV_ERR_UNKNOWN;
++    OH_AVFormat_Destroy(format);
++    if (err != AV_ERR_OK) {
++        // Do not pretend frame dropping stopped if FULL could not be restored.
++        av_log(avctx, AV_LOG_ERROR,
++               "[OHCodecPolicy] smart-fluency=full-restore-failed error=%d\n", err);
++        s->full_restore_error = ff_oh_err_to_ff_err(err);
++        return s->full_restore_error;
++    }
++    s->smart_fluency_active = false;
++    av_log(avctx, AV_LOG_WARNING,
++           "[OHCodecPolicy] smart-fluency=disabled retention=full\n");
++    return 0;
++}
++
++static int oh_decode_update_vrr_policy(AVCodecContext *avctx)
++{
++    OHCodecDecContext *s = avctx->priv_data;
++    if (!s->vrr_pending || !s->dec)
++        return 0;
++    s->vrr_pending = false;
++    if (s->vrr_failed || !s->keys.enable_vrr)
++        return 0;
++    const double fps = s->source_frame_rate *
++                       fmax(s->requested_playback_speed, 1.0);
++    if (s->vrr_enabled && (!s->keys.frame_rate || fps <= 0.0))
++        return 0;
++    OH_AVFormat *format = OH_AVFormat_Create();
++    if (!format)
++        return AVERROR(ENOMEM);
++    bool valid = OH_AVFormat_SetIntValue(format, s->keys.enable_vrr,
++                                        s->vrr_enabled);
++    if (s->vrr_enabled)
++        valid = valid && OH_AVFormat_SetDoubleValue(format, s->keys.frame_rate, fps);
++    OH_AVErrCode err = valid ? OH_VideoDecoder_SetParameter(s->dec, format)
++                            : AV_ERR_UNKNOWN;
++    OH_AVFormat_Destroy(format);
++    if (err == AV_ERR_OK)
++        s->vrr_applied = s->vrr_enabled;
++    if (err == AV_ERR_OK && s->vrr_enabled && s->preroll)
++        s->playback_policy_pending = true; // Restore the preroll decode-rate floor.
++    av_log(avctx, AV_LOG_WARNING,
++           "[OHCodecPolicy] vrr=%s mode=%s fps=%.3f set-parameter=%d "
++           "screen-effect=platform-dependent\n",
++           err != AV_ERR_OK ? "request-failed" :
++               (s->vrr_enabled ? "requested" : "disabled"),
++           s->direct_surface_output ? "direct-surface" : "gpu-buffer", fps, err);
++    int ret = oh_decode_policy_error(avctx, "vrr", err, &s->vrr_failed);
++    if (ret < 0 || err == AV_ERR_OK || !s->vrr_enabled)
++        return ret;
++    // A rejected enable may have been partially applied. Best-effort off only;
++    // never reset/recreate a running decoder for an optional VRR request.
++    format = OH_AVFormat_Create();
++    if (!format)
++        return AVERROR(ENOMEM);
++    valid = OH_AVFormat_SetIntValue(format, s->keys.enable_vrr, 0);
++    err = valid ? OH_VideoDecoder_SetParameter(s->dec, format) : AV_ERR_UNKNOWN;
++    OH_AVFormat_Destroy(format);
++    if (err == AV_ERR_OK)
++        s->vrr_applied = 0;
++    av_log(avctx, AV_LOG_WARNING,
++           "[OHCodecPolicy] vrr=request-updates-stopped last-applied=%d off-result=%d\n",
++           s->vrr_applied, err);
++    return oh_decode_policy_error(avctx, "vrr-off", err, NULL);
++}
++
++static int oh_decode_update_playback_policy(AVCodecContext *avctx)
+ {
+     OHCodecDecContext *s = avctx->priv_data;
+     const double speed = s->requested_playback_speed;
+ 
+     if (!s->playback_policy_pending || !s->dec)
+-        return;
++        return 0;
+     s->playback_policy_pending = false;
+ 
+     // A performance hint only: output timestamps and playback speed stay
+@@ -1141,7 +1288,8 @@ static void oh_decode_update_playback_policy(AVCodecContext *avctx)
+                s->preroll ? 120.0 : 0.0) : 0.0;
+     const bool enable_smart_fluency = speed > 1.0 + 1e-6 &&
+                                      !s->preroll && !s->preserve_frames;
+-    const bool update_smart_fluency = !s->smart_fluency_failed &&
++    const bool update_smart_fluency = s->smart_fluency_prepared &&
++        !s->smart_fluency_failed &&
+         s->keys.retention_mode && s->keys.decoder_speed &&
+         oh_decode_supports_smart_fluency(avctx) &&
+         (enable_smart_fluency || s->smart_fluency_active);
+@@ -1156,11 +1304,13 @@ static void oh_decode_update_playback_policy(AVCodecContext *avctx)
+     if (!update_smart_fluency && effective_frame_rate > 0.0 &&
+         s->keys.frame_rate) {
+         OH_AVFormat *rate_format = OH_AVFormat_Create();
+-        if (rate_format) {
++        if (!rate_format)
++            return AVERROR(ENOMEM);
++        {
++            OH_AVErrCode err = AV_ERR_UNKNOWN;
+             if (OH_AVFormat_SetDoubleValue(rate_format, s->keys.frame_rate,
+                                            effective_frame_rate)) {
+-                OH_AVErrCode err = OH_VideoDecoder_SetParameter(s->dec,
+-                                                                 rate_format);
++                err = OH_VideoDecoder_SetParameter(s->dec, rate_format);
+                 if (s->diagnostics_enabled)
+                     av_log(avctx, AV_LOG_VERBOSE,
+                            "[Perf] codec-decode-hints preroll=%d preserve=%d "
+@@ -1172,15 +1322,18 @@ static void oh_decode_update_playback_policy(AVCodecContext *avctx)
+                            "to %.3f: %d\n", effective_frame_rate, err);
+             }
+             OH_AVFormat_Destroy(rate_format);
++            int ret = oh_decode_policy_error(avctx, "frame-rate", err, NULL);
++            if (ret < 0)
++                return ret;
+         }
+     }
+ 
+     if (!update_smart_fluency)
+-        return;
++        return 0;
+ 
+     OH_AVFormat *format = OH_AVFormat_Create();
+     if (!format)
+-        return;
++        return AVERROR(ENOMEM);
+ 
+     const OH_FrameRetentionMode retention_mode = enable_smart_fluency
+         ? OH_FRAME_RETENTION_MODE_ADAPTIVE
+@@ -1198,7 +1351,7 @@ static void oh_decode_update_playback_policy(AVCodecContext *avctx)
+ 
+     int64_t perf_begin = s->diagnostics_enabled ? oh_decode_perf_time_ns() : 0;
+     OH_AVErrCode err = valid ? OH_VideoDecoder_SetParameter(s->dec, format)
+-                             : AV_ERR_INVALID_VAL;
++                             : AV_ERR_UNKNOWN;
+     if (s->diagnostics_enabled)
+         av_log(avctx, AV_LOG_VERBOSE,
+                "[Perf] codec-policy monoNs=%lld speed=%.3f fps=%.3f retention=%d requestAgeMs=%.3f setMs=%.3f ret=%d\n",
+@@ -1208,11 +1361,9 @@ static void oh_decode_update_playback_policy(AVCodecContext *avctx)
+     OH_AVFormat_Destroy(format);
+ 
+     if (err != AV_ERR_OK) {
+-        s->smart_fluency_failed = true;
+-        av_log(avctx, AV_LOG_WARNING,
+-               "[OHCodecPolicy] smart-fluency=request-failed speed=%.3f "
+-               "error=%d\n", speed, err);
+-        return;
++        int ret = oh_decode_policy_error(avctx, "smart-fluency", err,
++                                         &s->smart_fluency_failed);
++        return ret < 0 ? ret : oh_decode_restore_full(avctx);
+     }
+ 
+     s->smart_fluency_active = enable_smart_fluency;
+@@ -1220,6 +1371,7 @@ static void oh_decode_update_playback_policy(AVCodecContext *avctx)
+            "[OHCodecPolicy] smart-fluency=%s speed=%.3f "
+            "set-parameter=ok\n",
+            enable_smart_fluency ? "adaptive" : "full", speed);
++    return 0;
+ }
+ 
+ static int oh_decode_cond_wait(AVCond *cond, AVMutex *mutex)
+@@ -1239,7 +1391,16 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+ {
+     OHCodecDecContext *s = avctx->priv_data;
+ 
+-    oh_decode_update_playback_policy(avctx);
++    // Until the context is recreated, never output frames after failed FULL
++    // restoration. Repeated errors use mpv's existing decoder recovery path.
++    if (s->full_restore_error < 0)
++        return s->full_restore_error;
++    int policy_ret = oh_decode_update_vrr_policy(avctx);
++    if (policy_ret < 0)
++        return policy_ret;
++    policy_ret = oh_decode_update_playback_policy(avctx);
++    if (policy_ret < 0)
++        return policy_ret;
+ 
+     while (1) {
+         OHCodecDecQueueItem buffer = {0};
+@@ -1352,6 +1513,7 @@ static void oh_decode_flush(AVCodecContext *avctx)
+     s->eof_sent = false;
+     s->playback_policy_pending = true;
+     av_packet_unref(&s->pkt);
++    s->vrr_pending = true;
+     oh_decode_clear_dovi(s);
+     ff_dovi_ctx_flush(&s->dovi_ctx);
+     ff_mutex_unlock(&s->output_mutex);
+@@ -1382,6 +1544,20 @@ int avcodec_ohcodec_set_playback_speed(AVCodecContext *avctx, double speed)
+     return 0;
+ }
+ 
++int avcodec_ohcodec_set_vrr_enabled(AVCodecContext *avctx, int enabled)
++{
++    if (!avctx || !avctx->codec || !avctx->priv_data ||
++        !avctx->codec->wrapper_name ||
++        strcmp(avctx->codec->wrapper_name, "ohcodec"))
++        return AVERROR(ENOSYS);
++    OHCodecDecContext *s = avctx->priv_data;
++    if (s->vrr_enabled == !!enabled)
++        return 0;
++    s->vrr_enabled = !!enabled;
++    s->vrr_pending = true;
++    return 0;
++}
++
+ int avcodec_ohcodec_set_decode_hints(AVCodecContext *avctx, int preroll,
+                                     int preserve_frames)
+ {
+@@ -1418,6 +1594,8 @@ static const AVOption ohcodec_vdec_options[] = {
+          OFFSET(name), AV_OPT_TYPE_STRING, .flags = VD},
+     {"allow_sw", "Allow software decoding",
+          OFFSET(allow_sw), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD},
++    {"ohcodec_vrr", "Enable optional decoder video variable refresh rate",
++         OFFSET(vrr_enabled), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD},
+     {NULL}
+ };
+ 

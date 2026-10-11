@@ -178,15 +178,46 @@ must not be interpreted as dropped video frames.
 Both OHCodec output paths automatically pass the source frame rate to the
 decoder and request decoder-side variable refresh rate support. Playback-speed
 changes are forwarded internally to OHCodec: on systems exposing the API 26
-smart-fluency keys, speeds above 1x use adaptive frame retention and returning
-to 1x restores full retention.
+smart-fluency keys, Configure first requests ADAPTIVE (and a valid 1x speed) to
+prepare hardware motion-vector output. Before submitting packets, normal/slow
+playback restores FULL; speeds above 1x use ADAPTIVE. Preroll and timestamp
+repair always preserve full frames. Only a parameter/format rejection triggers
+an initialization retry without smart-fluency keys: first Reset the same decoder,
+and recreate it once only if Reset fails. A failed baseline retry or memory,
+service/state error is handled as a decoder error, not a feature-support verdict.
+VRR is independent: Configure contains no VRR key; the first decoder-thread
+policy update after Start sends the requested VRR state via SetParameter.
+
+The internal `ohos-vrr` boolean (default yes) lets an embedding application
+disable decoder VRR analysis when a visible, non-empty danmaku overlay is
+enabled, and restore it when the overlay is disabled/hidden. It is set before
+decoder creation and updated on the decoder thread without a seek or restart.
+SweetVideo follows its existing danmaku state; no additional UI setting or
+N-API symbol is required. Older libmpv builds without this hook keep playing.
 
 Policy results are emitted automatically with the `[OHCodecPolicy]` prefix at
 warning level so hosts using the default mpv warning log level can diagnose the
 feature without a user-facing setting. A successful decoder request reports
-`vrr=requested ... configure=ok` for either `mode=surface` or `mode=buffer`;
+`vrr=requested ... set-parameter=0` with `mode=direct-surface` or `mode=gpu-buffer`;
 smart fluency reports `smart-fluency=adaptive ... set-parameter=ok` and reports
-`smart-fluency=full` when playback returns to 1x.
+`smart-fluency=full` when playback returns to 1x. `smart-fluency=prepared` means
+MV output was requested at initialization, not proof the hardware supplies MV.
+Dynamic VRR logs report `requested`/`disabled` and the platform result, never
+claim that the display rate changed. Parameter rejection stops updates only for
+the corresponding enhancement: smart fluency requests FULL, and a rejected VRR
+enable makes one best-effort off request. Neither resets nor recreates a running
+decoder. If FULL cannot be restored, or an API returns a memory/service/state
+error, the existing decode error path is used instead of assuming normal frames.
+A failed FULL restoration blocks further frame output until context recreation;
+it does not run an unbounded parameter-retry loop. VRR initialization/re-enable
+also preserves the existing preroll decode-rate floor.
+A rejected VRR off keeps the last known applied state in the log; it is never
+reported as successfully disabled. Current official VRR documentation only
+guarantees hardware-decoded direct presentation. Retaining a request in the GPU
+buffer path does not establish that final display presentation benefits from it.
+
+See Huawei's [smart fluency guide](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/video-smart-fluency-decoding)
+and [VRR guide](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/video-variable-refreshrate).
 
 The API 26 SDK declarations and official `OH_FrameRetentionMode` values are
 used at compile time, while optional metadata-key symbols are resolved with
