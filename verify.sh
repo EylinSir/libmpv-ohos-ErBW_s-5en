@@ -14,6 +14,10 @@ if [ ! -f "$LIBMPV" ]; then
 fi
 
 elf_header=$("$READELF" -h "$LIBMPV")
+if ! "$STRINGS" "$LIBMPV" | grep -F 'secondary-sub-scale' >/dev/null; then
+  echo 'Missing independent secondary subtitle scale option' >&2
+  exit 1
+fi
 if ! grep -F "Machine:" <<< "$elf_header" | grep -F "$ELF_MACHINE" >/dev/null; then
   echo "Wrong output architecture; expected $MPV_BUILD_ARCH ($ELF_MACHINE)" >&2
   exit 1

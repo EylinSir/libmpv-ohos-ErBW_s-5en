@@ -1,0 +1,92 @@
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index fa71dc0d1e..3f39355adb 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -2569,6 +2569,14 @@ Subtitles
+     Specify the position of secondary subtitles on the screen. This is similar
+     to ``--sub-pos`` but for secondary subtitles.
+ 
++``--secondary-sub-scale=<0-100>``
++    Scale secondary subtitles independently of ``--sub-scale`` (default: 1).
++    Uses the secondary ASS override mode. Text subtitles still use the shared
++    base font size; clients that need an absolute secondary size should divide
++    the desired font size by ``--sub-font-size``. For styled ASS subtitles in
++    scale mode, this scales their original size. Bitmap subtitles are scaled
++    as images rather than re-rendered text.
++
+ ``--sub-speed=<0.1-10.0>``
+     Multiply the subtitle event timestamps with the given value. Can be used
+     to fix the playback speed for frame-based subtitle formats. Affects text
+diff --git a/options/options.c b/options/options.c
+index 37e1bb4876..411ee537f1 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -385,6 +385,7 @@ const struct m_sub_options mp_subtitle_shared_sub_opts = {
+         {"secondary-sub-delay", OPT_FLOAT(sub_delay[1])},
+         {"sub-pos", OPT_FLOAT(sub_pos[0]), M_RANGE(0.0, 150.0)},
+         {"secondary-sub-pos", OPT_FLOAT(sub_pos[1]), M_RANGE(0.0, 150.0)},
++        {"secondary-sub-scale", OPT_FLOAT(secondary_sub_scale), M_RANGE(0.0, 100.0)},
+         {"sub-visibility", OPT_BOOL(sub_visibility[0])},
+         {"secondary-sub-visibility", OPT_BOOL(sub_visibility[1])},
+         {"sub-ass-override", OPT_CHOICE(ass_style_override[0],
+@@ -406,6 +407,7 @@ const struct m_sub_options mp_subtitle_shared_sub_opts = {
+     .size = sizeof(OPT_BASE_STRUCT),
+     .defaults = &(OPT_BASE_STRUCT){
+         .sub_visibility[0] = true,
++        .secondary_sub_scale = 1.0,
+         .sub_visibility[1] = true,
+         .sub_pos[0] = 100,
+         .ass_style_override[0] = ASS_STYLE_OVERRIDE_SCALE,
+@@ -1178,6 +1180,7 @@ static const struct MPOpts mp_default_opts = {
+         "secondary-sid",
+         "secondary-sub-delay",
+         "secondary-sub-pos",
++        "secondary-sub-scale",
+         "secondary-sub-ass-override",
+         "secondary-sub-visibility",
+         "ab-loop-a",
+diff --git a/options/options.h b/options/options.h
+index 6ff62e66ce..c4f20c7d35 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -142,6 +142,7 @@ struct mp_subtitle_opts {
+ 
+ // Options for both primary and secondary subs.
+ struct mp_subtitle_shared_opts {
++    float secondary_sub_scale;
+     float sub_delay[2];
+     float sub_pos[2];
+     bool sub_visibility[2];
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index ece372a231..d53b990af5 100644
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -555,7 +555,8 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
+         set_hinting = opts->sub_hinting;
+     }
+     if (total_override || shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_SCALE) {
+-        set_font_scale = opts->sub_scale;
++        set_font_scale = sd->order == 1 ? shared_opts->secondary_sub_scale :
++                                         opts->sub_scale;
+     }
+     if (set_scale_with_window) {
+         set_font_scale *= dim->h / MPMAX(get_libass_scale_height(dim, set_use_margins), 1);
+diff --git a/sub/sd_lavc.c b/sub/sd_lavc.c
+index 5cbc6d0a21..1f1ac4179a 100644
+--- a/sub/sd_lavc.c
++++ b/sub/sd_lavc.c
+@@ -526,11 +526,12 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
+ 
+     osd_rescale_bitmaps(res, w, h, d, video_par);
+ 
+-    if (opts->sub_scale != 1.0 && shared_opts->ass_style_override[sd->order]) {
++    float sub_scale = sd->order == 1 ? shared_opts->secondary_sub_scale : opts->sub_scale;
++    if (sub_scale != 1.0 && shared_opts->ass_style_override[sd->order]) {
+         for (int n = 0; n < res->num_parts; n++) {
+             struct sub_bitmap *sub = &res->parts[n];
+ 
+-            float shit = (opts->sub_scale - 1.0f) / 2;
++            float shit = (sub_scale - 1.0f) / 2;
+ 
+             // Fortunately VO isn't supposed to give a FUCKING FUCK about
+             // whether the sub might e.g. go outside of the screen.

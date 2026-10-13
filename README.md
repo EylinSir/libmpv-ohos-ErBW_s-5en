@@ -379,6 +379,13 @@ ohos sdk is automatically downloaded on Linux / WSL, but you need to manually do
 
 ## Build
 
+Secondary subtitle positioning uses `secondary-sub-pos`. The downstream
+`secondary-sub-scale` option independently scales text/ASS and bitmap secondary
+subtitles without following the primary `sub-scale`. SweetVideo's independent
+secondary size controls require a library rebuilt with this patch; updating
+only `libmpvnative.so` is insufficient. `patch.sh` checks the source and
+`verify.sh` checks that the option is included in the resulting library.
+
 ```shell
 chmod +x *.sh */*.sh
 ./bundle.sh
